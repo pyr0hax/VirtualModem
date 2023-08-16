@@ -1,107 +1,142 @@
 import serial
+import threading
 import time
-import pjsua
+from pjnath import *
+from pjmedia import *
+from pjlib import *
+from pj import *
+import queue
 import configparser
 
-config = configparser.ConfigParser()
-config.read('config.ini')
+class SipParty:
+    def __init__(self, name):
+        self.name = name
 
-com_port = config.get('Serial', 'com_port', fallback='COM1')
-baud_rate = config.getint('Serial', 'baud_rate', fallback=9600)
+    def send_data(self, data):
+        print(f"{self.name} (SIP): Sending: {data}")
 
-sip_username = config.get('SIP', 'username', fallback='your_username')
-sip_password = config.get('SIP', 'password', fallback='your_password')
-asterisk_server_ip = config.get('SIP', 'server_ip', fallback='your_asterisk_server_ip')
-sip_extension = config.get('SIP', 'extension', fallback='extension')
+    def receive_data(self, data):
+        print(f"{self.name} (SIP): Receiving: {data}")
+        return data
 
-ser = serial.Serial(com_port, baud_rate, timeout=1)
+class PJSUACallHandler(pjsua.CallCallback):
+    def __init__(self):
+        pjsua.CallCallback.__init__(self)
 
-def on_call_state(call):
-    if call.info().state == pjsua.CallState.CONFIRMED:
-        print("Call is confirmed")
+    def on_state(self, prm):
+        pass
 
-pjsua.Lib.instance().init()
-transport_config = pjsua.TransportConfig()
-pjsua.Lib.instance().create_transport(pjsua.TransportType.UDP, transport_config)
+    def on_media_state(self, prm):
+        pass
 
-account_config = pjsua.AccountConfig()
-account_config.id = f"sip:{sip_username}@{asterisk_server_ip}"
-account_config.reg_uri = f"sip:{asterisk_server_ip}"
-account_config.cred_info = [pjsua.AuthCred("*", sip_username, sip_password)]
+class VirtualModem:
+    def __init__(self, com_port, sip_config):
+        self.com_port = com_port
+        self.sip_config = sip_config
+        self.serial = None
+        self.running = False
+        self.pjsua = None
+        self.send_queue = queue.Queue()
+        self.receive_queue = queue.Queue()
 
-account = pjsua.Account()
-account.create(account_config)
+    def initialize(self):
+        pjsua_lib.init()
+        self.pjsua = pjsua.Lib()
+        self.pjsua.init()
 
-call = None
+        acc_config = pjsua.AccountConfig()
+        acc_config.id = 'sip:' + self.sip_config['username'] + '@' + self.sip_config['server']
+        acc_config.reg_uri = 'sip:' + self.sip_config['server']
+        self.account = self.pjsua.create_account(acc_config)
 
-def perform_handshake():
-    ser.write("ATZ\r".encode())
-    response = ser.read_until("OK\r\n".encode(), timeout=5)
-    
-    if b'OK' in response:
-        ser.setRTS(True)  
-        time.sleep(1)     
-        
-        ser.setDTR(True)  
-        time.sleep(1)     
-        
-        ser.write("CONNECT\r\n".encode())
-        print("Handshake successful. Modems connected.")
-        return True
-    else:
-        print("Handshake failed.")
-        return False
+        self.serial = serial.Serial(self.com_port, baudrate=9600)
 
-try:
-    while True:
-        if ser.in_waiting > 0:
-            data = ser.readline().decode().strip()
-            print(f"Received from Serial: {data}")
-            
-            if data.startswith("AT"):
-                if data == "ATD":
-                    call = account.make_call(f"sip:{sip_extension}@{asterisk_server_ip}", cb=on_call_state)
-                elif data == "ATH":
-                    if call:
-                        call.hangup()
-                        call = None
-                else:
-                    pass
-            else:
-                if call:
-                    try:
-                        call.send_dtmf(data)
-                    except pjsua.Error as e:
-                        print(f"Error sending DTMF: {e}")
-        
-        events = pjsua.Lib.instance().handle_events()
-        for event in events:
-            if event.type == pjsua.PJSIP_EVENT_CALL_MEDIA_STATE:
-                if call and call.info().media_state == pjsua.MediaState.ACTIVE:
-                    while call.info().media_state == pjsua.MediaState.ACTIVE:
-                        try:
-                            dtmf = call.get_dtmf()
-                            if dtmf:
-                                print(f"Received from SIP: {dtmf}")
-                                ser.write(dtmf.encode())
-                        except pjsua.Error as e:
-                            break
-                        
-                    if ser.in_waiting > 0:
-                        data = ser.readline().decode().strip()
-                        if data:
-                            print(f"Received from remote modem: {data}")
-                            
-                            if call:
-                                try:
-                                    call.send_dtmf(data)
-                                except pjsua.Error as e:
-                                    print(f"Error sending data over SIP: {e}")
+    def handle_incoming_data(self):
+        while self.running:
+            if self.serial.in_waiting > 0:
+                data = self.serial.read(self.serial.in_waiting)
+                data_str = data.decode('utf-8')
+                self.sip_party.send_data(data_str)
                 
-except KeyboardInterrupt:
-    pass
-finally:
-    if call:
-        call.hangup()
-    pjsua.Lib.instance().shutdown()
-    ser.close()
+                if data_str.startswith("AT"):
+                    response = self.handle_at_command(data_str)
+                    self.send_queue.put(response)
+                else:
+                    self.receive_queue.put(data_str)
+
+    def handle_outgoing_data(self):
+        while self.running:
+            try:
+                data = self.send_queue.get(timeout=0.1)
+                self.serial.write(data.encode('utf-8'))
+            except queue.Empty:
+                pass
+
+    def handle_at_command(self, at_command):
+        if at_command == "AT":
+            response = "OK"
+        elif at_command == "ATI":
+            response = "Virtual Modem Version 1.0"
+        elif at_command.startswith("ATD"):
+            response = "Dialing..."
+        elif at_command == "ATA":
+            response = "Answering call..."
+        elif at_command == "ATH":
+            response = "Hanging up..."
+        elif at_command == "ATZ":
+            response = "Modem reset"
+        elif at_command == "AT+CMGS":
+            response = "Enter SMS text"
+        elif at_command == "AT+CMGR":
+            response = "SMS message content"
+        elif at_command == "AT+CREG":
+            response = "+CREG: 0,1"
+        elif at_command == "AT+CSQ":
+            response = "+CSQ: 20,0"
+        else:
+            response = "ERROR"
+        return response
+
+    def start(self):
+        self.initialize()
+        self.running = True
+
+        incoming_thread = threading.Thread(target=self.handle_incoming_data)
+        outgoing_thread = threading.Thread(target=self.handle_outgoing_data)
+
+        incoming_thread.start()
+        outgoing_thread.start()
+
+    def stop(self):
+        self.running = False
+        self.serial.close()
+        self.pjsua.destroy()
+        self.pjsua.libDestroy()
+
+def main():
+    config = configparser.ConfigParser()
+    config.read('config.ini')
+
+    com_config = config['VirtualModem']
+    sip_config = {
+        "username": config['SIP']['username'],
+        "password": config['SIP']['password'],
+        "server": config['SIP']['server']
+    }
+
+    sip_party = SipParty("Virtual Modem")
+    virtual_modem = VirtualModem(com_config['com_port'], sip_config)
+    virtual_modem.start()
+
+    try:
+        while True:
+            if virtual_modem.running:
+                received_data = virtual_modem.receive_queue.get()
+                virtual_modem.send_queue.put(received_data)
+
+            time.sleep(1)
+    except KeyboardInterrupt:
+        virtual_modem.stop()
+
+if __name__ == "__main__":
+    main()
